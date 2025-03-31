@@ -2,6 +2,8 @@ import psycopg2
 import requests 
 import streamlit as st 
 import pandas as pd 
+import functools 
+import time  
 
 # Groq API details
 GROQ_MODEL = "llama-3.3-70b-versatile" 
@@ -20,9 +22,38 @@ if "explanation" not in st.session_state:
     st.session_state["explanation"] = ""
 
 
+# Custom cache for fetch_table_schema
+schema_cache = {}
+
+def get_db_connection(retries=3, delay=2):
+    """Obtain a DB connection with simple retry logic."""
+    for attempt in range(retries):
+        try:
+            return psycopg2.connect(DB_URL)
+        except psycopg2.Error as e:
+            if attempt == retries - 1:
+                raise e
+            time.sleep(delay)
+
+def call_groq_api(data, headers, retries=3, delay=2):
+    """Call Groq API with simple retry logic."""
+    for attempt in range(retries):
+        try:
+            response = requests.post(GROQ_API_URL, headers=headers, json=data)
+            if response.status_code == 200:
+                return response
+            else:
+                raise requests.RequestException(f"Groq API returned {response.status_code}")
+        except requests.RequestException as e:
+            if attempt == retries - 1:
+                raise e
+            time.sleep(delay)
+
+@st.cache_data(show_spinner=False)
 def fetch_table_schema():
     """Fetch table names and column details dynamically from NeonDB."""
-    conn = psycopg2.connect(DB_URL)
+    start_time = time.time()  # Start timing
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -38,7 +69,68 @@ def fetch_table_schema():
         schema_info[table_name].append((column_name, data_type))
 
     conn.close()
+    end_time = time.time()  # End timing
+    print(f"fetch_table_schema executed in {end_time - start_time:.4f} seconds")
+
     return schema_info
+
+def create_indexes():
+    """Dynamically create indexes on foreign keys and frequently queried columns."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Fetch existing tables
+    cursor.execute("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+    """)
+    existing_tables = {row[0] for row in cursor.fetchall()}
+
+    # Fetch foreign keys from the database schema
+    cursor.execute("""
+        SELECT
+            tc.table_name, kcu.column_name
+        FROM
+            information_schema.table_constraints AS tc
+        JOIN
+            information_schema.key_column_usage AS kcu
+        ON
+            tc.constraint_name = kcu.constraint_name
+        WHERE
+            tc.constraint_type = 'FOREIGN KEY'
+    """)
+
+    foreign_keys = cursor.fetchall()
+
+    # Create indexes for foreign keys
+    for table, column in foreign_keys:
+        if table in existing_tables:  # Check if table exists
+            index_name = f"{table.lower()}_{column.lower()}_fk_idx"
+            cursor.execute(f"""
+                CREATE INDEX IF NOT EXISTS {index_name}
+                ON {table} ({column});
+            """)
+
+    # Optionally, add indexes for other frequently queried columns
+    frequently_queried_columns = [
+        ("Genres", "Name"),
+        ("Albums", "Title"),
+    ]
+
+    for table, column in frequently_queried_columns:
+        if table in existing_tables:  # Check if table exists
+            index_name = f"{table.lower()}_{column.lower()}_idx"
+            cursor.execute(f"""
+                CREATE INDEX IF NOT EXISTS {index_name}
+                ON {table} ({column});
+            """)
+
+    conn.commit()
+    conn.close()
+
+# Call create_indexes during initialization
+create_indexes()
 
 def generate_sql_query_groq(user_prompt, schema_info):
     """Uses Groq API to dynamically generate a valid SQL query based on schema."""
@@ -47,6 +139,19 @@ def generate_sql_query_groq(user_prompt, schema_info):
         f"Table: {table}, Columns: {', '.join([col[0] for col in columns])}"
         for table, columns in schema_info.items()
     ])
+
+    # Handle specific requests like fetching database names
+    if "fetch all database names" in user_prompt.lower():
+        return "SELECT datname FROM pg_database WHERE datistemplate = false;"
+
+    # Handle requests for all attributes in a specific table
+    if "all attributes in" in user_prompt.lower():
+        table_name = user_prompt.lower().split("all attributes in")[-1].strip()
+        return f"""
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_name = '{table_name}';
+        """
 
     prompt = f"""
     You are an expert in SQL with knowledge of the Chinook database.
@@ -64,6 +169,8 @@ def generate_sql_query_groq(user_prompt, schema_info):
     - Use correct table relationships (e.g., Tracks, Genres, Albums).
     - Prioritize tables directly relevant to the request.
     - Do NOT make up table names or columns.
+    - If the user request is unrelated to the database schema, return "SELECT NULL WHERE FALSE;".
+    - Do NOT respond conversationally or provide explanations.
 
     Provide only the SQL query without explanations.
     """
@@ -76,12 +183,32 @@ def generate_sql_query_groq(user_prompt, schema_info):
         "max_tokens": 200
     }
 
-    response = requests.post(GROQ_API_URL, headers=headers, json=data)
+    response = call_groq_api(data, headers)
 
     if response.status_code == 200:
-        return response.json()["choices"][0]["message"]["content"].strip()
+        final_query = response.json()["choices"][0]["message"]["content"].strip()
+        print("Generated SQL Query:", repr(final_query))  # Debugging print
+        return final_query
     else:
         return f"Error: {response.json()}"
+
+# Custom cache for execute_sql_with_cache
+query_cache = {}
+
+@st.cache_data(show_spinner=False)
+def execute_sql_with_cache(query: str):
+    """Executes the SQL query with caching using Streamlit's cache."""
+    query = query.strip()  # Normalize query string
+    start_time = time.time()  # Start timing
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(query)
+    result = cursor.fetchall()
+    colnames = [desc[0] for desc in cursor.description]
+    conn.close()
+    end_time = time.time()  # End timing
+    print(f"execute_sql_with_cache executed in {end_time - start_time:.4f} seconds")
+    return result, colnames
 
 def execute_sql(query):
     """Executes the SQL query with retry logic for fixes."""
@@ -91,13 +218,11 @@ def execute_sql(query):
     while retry_count < max_retries:
         try:
             clean_query = query.strip("```sql").strip("```")
-            conn = psycopg2.connect(DB_URL)
-            cursor = conn.cursor()
-            cursor.execute(clean_query)
-            result = cursor.fetchall()
-            colnames = [desc[0] for desc in cursor.description]
-            conn.close()
-            return result, colnames
+            start_time = time.time()  # Start timing
+            result = execute_sql_with_cache(clean_query)
+            end_time = time.time()  # End timing
+            print(f"execute_sql executed in {end_time - start_time:.4f} seconds")
+            return result
         except psycopg2.Error as e:
             if retry_count >= max_retries - 1:
                 return f"SQL Execution Error after {max_retries} retries: {str(e)}", []
@@ -105,7 +230,6 @@ def execute_sql(query):
             query = suggest_query_fix(query, str(e))
 
     return "Execution failed.", []
-
 
 
 def suggest_query_fix(query, error_message):
@@ -136,7 +260,7 @@ def suggest_query_fix(query, error_message):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     data = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 200}
 
-    response = requests.post(GROQ_API_URL, headers=headers, json=data)
+    response = call_groq_api(data, headers)
     
     if response.status_code == 200:
         new_query = response.json()["choices"][0]["message"]["content"].strip()
@@ -159,7 +283,8 @@ def explain_sql_query(query):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     data = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 200}
 
-    response = requests.post(GROQ_API_URL, headers=headers, json=data)
+    # Corrected the json parameter
+    response = call_groq_api(data, headers)
     if response.status_code == 200:
         return response.json()["choices"][0]["message"]["content"].strip()
     else:
@@ -190,4 +315,23 @@ if st.button("Explain Query"):
     st.session_state["explanation"] = explain_sql_query(st.session_state["sql_query"])
     st.write("📝 **Query Explanation:**")
     st.write(st.session_state["explanation"])
+
+# if st.button("Test fetch_table_schema Cache"):
+#     # Call repeatedly to test cache hits.
+#     start = time.time()
+#     schema1 = fetch_table_schema()
+#     t1 = time.time() - start
+#     start = time.time()
+#     schema2 = fetch_table_schema()
+#     t2 = time.time() - start
+#     st.write(f"First call: {t1:.4f}s, Second call: {t2:.4f}s")
+
+# if st.button("Test Repeated Queries"):
+#     repeated_query = "SELECT * FROM genre;"  # or any query you'd like to benchmark
+#     num_tests = 5
+#     for i in range(num_tests):
+#         start = time.time()
+#         _ = execute_sql_with_cache(repeated_query)
+#         duration = time.time() - start
+#         st.write(f"Run {i+1}: {duration:.4f} seconds")
 
